@@ -71,12 +71,14 @@ Debugging Tips:
 import asyncio
 import base64 # Added for WireViz image encoding
 import datetime # Added for WireViz timestamped directories
+import uuid
 import json
 import logging
 import os
 import re
 import shutil  # Used for finding executable and file operations
 import subprocess
+import threading
 import sys # Added for exit calls and platform detection
 import openai  # For GPT-4.1 API calls
 
@@ -92,8 +94,10 @@ def set_openai_api_key(key: str):
 
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import (Any, AsyncIterator, Dict, List, Optional, Set, Tuple,
+from typing import (Any, AsyncIterator, Deque, Dict, List, Optional, Set, Tuple,
                     Union)
+from collections import deque
+from dataclasses import dataclass, field
 
 # --- MCP Imports ---
 try:
@@ -146,6 +150,39 @@ SKETCHES_BASE_DIR: Path = USER_HOME / "Documents" / "Arduino_MCP_Sketches"
 BUILD_TEMP_DIR: Path = SKETCHES_BASE_DIR / "_build_temp"
 FUZZY_SEARCH_THRESHOLD: int = 75  # Minimum score (0-100) for fuzzy matches
 DEFAULT_FQBN: str = "arduino:avr:uno" # Default FQBN for write_file auto-compile
+SERIAL_LOG_DIR: Path = SKETCHES_BASE_DIR / "_serial_logs"
+SERIAL_DEFAULT_BAUD: int = 115200
+SERIAL_DEFAULT_BUFFER_LINES: int = 2000
+SERIAL_DEFAULT_LOG_MAX_BYTES: int = 5 * 1024 * 1024
+SERIAL_DEFAULT_LOG_ROTATE_COUNT: int = 3
+SERIAL_RECONNECT_INITIAL_DELAY: float = 1.0
+SERIAL_RECONNECT_MAX_DELAY: float = 5.0
+
+def _env_int(name: str, default: int, allow_zero: bool = True) -> int:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        log.warning(f"Invalid integer for {name}='{raw}', using default {default}.")
+        return default
+    if value < 0 or (value == 0 and not allow_zero):
+        log.warning(f"Out of range value for {name}='{raw}', using default {default}.")
+        return default
+    return value
+
+# Env overrides for serial log defaults
+SERIAL_DEFAULT_LOG_MAX_BYTES = _env_int(
+    "ARDUINO_SERIAL_LOG_MAX_BYTES",
+    SERIAL_DEFAULT_LOG_MAX_BYTES,
+    allow_zero=True
+)
+SERIAL_DEFAULT_LOG_ROTATE_COUNT = _env_int(
+    "ARDUINO_SERIAL_LOG_ROTATE_COUNT",
+    SERIAL_DEFAULT_LOG_ROTATE_COUNT,
+    allow_zero=True
+)
 
 # --- Arduino Directories Detection ---
 ARDUINO_DATA_DIR: Path
@@ -198,6 +235,38 @@ else:
                  f"arduino-cli not found via 'which' or common paths. Using default "
                  f"'{ARDUINO_CLI_PATH}'. Ensure it's installed and accessible in PATH."
              )
+
+# ==============================================================================
+# Serial Monitor State
+# ==============================================================================
+
+@dataclass
+class SerialMonitorState:
+    monitor_id: str
+    port: str
+    baud: int
+    board_fqbn: Optional[str]
+    protocol: Optional[str]
+    auto_reconnect: bool
+    auto_reconnect_user: bool
+    reconnect_delay: float
+    stop_requested: bool
+    buffer_max: int
+    buffer: Deque[str]
+    log_path: Optional[Path]
+    log_max_bytes: int
+    log_rotate_count: int
+    process: Optional[subprocess.Popen] = None
+    reader_thread: Optional[threading.Thread] = None
+    stop_event: threading.Event = field(default_factory=threading.Event)
+    tasks: List[asyncio.Task] = field(default_factory=list)
+    running: bool = False
+    started_at: Optional[datetime.datetime] = None
+    last_line_at: Optional[datetime.datetime] = None
+
+
+_SERIAL_MONITORS: Dict[str, SerialMonitorState] = {}
+_SERIAL_MONITORS_LOCK = asyncio.Lock()
 
 # --- WireViz Path Detection ---
 _wireviz_path_override = os.environ.get("WIREVIZ_PATH")
@@ -425,6 +494,316 @@ async def _run_wireviz_command(
     return await _run_cli_command(
         WIREVIZ_PATH, cmd_args, check, cwd, log_prefix="wireviz"
     )
+
+# ==============================================================================
+# Serial Monitor Helpers
+# ==============================================================================
+
+def _sanitize_filename(value: str) -> str:
+    return re.sub(r"[^A-Za-z0-9_.-]", "_", value)
+
+def _default_serial_log_path(port: str) -> Path:
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    safe_port = _sanitize_filename(port)
+    return SERIAL_LOG_DIR / f"{safe_port}_{timestamp}.log"
+
+def _rotate_log_path(base_path: Path, index: int) -> Path:
+    return base_path.with_suffix(base_path.suffix + f".{index}")
+
+def _sync_rotate_log_if_needed(filepath: Path, max_bytes: int, rotate_count: int) -> None:
+    if max_bytes <= 0:
+        return
+    if not filepath.exists():
+        return
+    try:
+        size = filepath.stat().st_size
+    except OSError:
+        return
+    if size < max_bytes:
+        return
+
+    if rotate_count <= 0:
+        filepath.write_text("", encoding="utf-8")
+        return
+
+    for i in range(rotate_count, 1, -1):
+        src = _rotate_log_path(filepath, i - 1)
+        dst = _rotate_log_path(filepath, i)
+        if src.exists():
+            src.replace(dst)
+    filepath.replace(_rotate_log_path(filepath, 1))
+
+def _sync_append_line_with_rotation(
+    filepath: Path,
+    line: str,
+    max_bytes: int,
+    rotate_count: int,
+    encoding: str = "utf-8"
+) -> None:
+    filepath.parent.mkdir(parents=True, exist_ok=True)
+    _sync_rotate_log_if_needed(filepath, max_bytes, rotate_count)
+    with filepath.open("a", encoding=encoding) as handle:
+        handle.write(line + "\n")
+
+def _build_serial_monitor_cmd_args(state: SerialMonitorState) -> List[str]:
+    args = [
+        "monitor",
+        "-p", state.port,
+        "--config", f"baudrate={state.baud}",
+        "--quiet",
+        "--no-color",
+    ]
+    if state.board_fqbn:
+        args += ["-b", state.board_fqbn]
+    if state.protocol:
+        args += ["-l", state.protocol]
+    return args
+
+# Windows + asyncio subprocess pipes can starve the event loop; read in a thread.
+def _serial_monitor_reader_thread(state: SerialMonitorState) -> None:
+    if not state.process or not state.process.stdout:
+        return
+    while not state.stop_event.is_set():
+        try:
+            chunk = state.process.stdout.readline()
+        except Exception as e:
+            log.warning(f"Serial monitor reader error ({state.monitor_id}): {e}")
+            break
+        if not chunk:
+            break
+        line = chunk.rstrip("\r\n")
+        state.last_line_at = datetime.datetime.now()
+        if line != "":
+            state.buffer.append(line)
+            if state.log_path:
+                _sync_append_line_with_rotation(
+                    state.log_path,
+                    line,
+                    state.log_max_bytes,
+                    state.log_rotate_count,
+                )
+        else:
+            state.buffer.append("")
+            if state.log_path:
+                _sync_append_line_with_rotation(
+                    state.log_path,
+                    "",
+                    state.log_max_bytes,
+                    state.log_rotate_count,
+                )
+
+async def _serial_monitor_waiter(state: SerialMonitorState) -> None:
+    if not state.process:
+        return
+    while True:
+        try:
+            await asyncio.to_thread(state.process.wait)
+        except Exception as e:
+            log.warning(f"Serial monitor process wait error ({state.monitor_id}): {e}")
+        state.running = False
+        state.stop_event.set()
+        if state.reader_thread and state.reader_thread.is_alive():
+            try:
+                await asyncio.to_thread(state.reader_thread.join, 1.0)
+            except Exception:
+                pass
+        state.reader_thread = None
+        if state.stop_requested or not state.auto_reconnect:
+            break
+
+        delay = max(state.reconnect_delay, SERIAL_RECONNECT_INITIAL_DELAY)
+        log.info(f"Serial monitor reconnecting ({state.monitor_id}) in {delay:.1f}s...")
+        await asyncio.sleep(delay)
+        if state.stop_requested or not state.auto_reconnect:
+            break
+        try:
+            await _start_serial_monitor_state(state)
+            state.reconnect_delay = SERIAL_RECONNECT_INITIAL_DELAY
+            break
+        except Exception as e:
+            log.warning(f"Serial monitor reconnect failed ({state.monitor_id}): {e}")
+            state.reconnect_delay = min(delay * 2.0, SERIAL_RECONNECT_MAX_DELAY)
+
+async def _start_serial_monitor_state(state: SerialMonitorState) -> None:
+    cmd_args = _build_serial_monitor_cmd_args(state)
+    env = os.environ.copy()
+    env.update({
+        "ARDUINO_DIRECTORIES_DATA": str(ARDUINO_DATA_DIR.resolve()),
+        "ARDUINO_DIRECTORIES_USER": str(ARDUINO_USER_DIR.resolve()),
+        "TMPDIR": str(BUILD_TEMP_DIR.resolve()),
+        "HOME": str(USER_HOME.resolve()),
+    })
+    cmd_str_for_log = " ".join(f'"{arg}"' if " " in arg else arg for arg in [ARDUINO_CLI_PATH] + cmd_args)
+    log.info(f"Starting serial monitor ({state.monitor_id}): {cmd_str_for_log}")
+    process = subprocess.Popen(
+        [ARDUINO_CLI_PATH, *cmd_args],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        stdin=subprocess.DEVNULL,
+        env=env,
+        bufsize=1,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    state.process = process
+    state.running = True
+    state.started_at = datetime.datetime.now()
+    state.stop_requested = False
+    state.stop_event.clear()
+    if state.reconnect_delay <= 0:
+        state.reconnect_delay = SERIAL_RECONNECT_INITIAL_DELAY
+    state.tasks = [
+        asyncio.create_task(_serial_monitor_waiter(state)),
+    ]
+    state.reader_thread = threading.Thread(
+        target=_serial_monitor_reader_thread,
+        args=(state,),
+        daemon=True,
+        name=f"mcp-serial-reader-{state.monitor_id}",
+    )
+    state.reader_thread.start()
+
+async def _detached_process_wait_popen(proc: subprocess.Popen, timeout_sec: float) -> None:
+    def _wait() -> None:
+        try:
+            proc.wait(timeout=timeout_sec)
+        except subprocess.TimeoutExpired:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+    await asyncio.to_thread(_wait)
+
+async def _stop_serial_monitor_state(
+    state: SerialMonitorState,
+    remove: bool = False,
+    force: bool = False,
+    timeout_sec: float = 2.0,
+    wait_tasks: bool = True,
+) -> None:
+    state.stop_requested = True
+    state.auto_reconnect = False
+    state.stop_event.set()
+    if state.process and state.process.poll() is None:
+        try:
+            if force:
+                state.process.kill()
+            else:
+                state.process.terminate()
+            if wait_tasks:
+                try:
+                    await asyncio.to_thread(state.process.wait, timeout_sec)
+                except subprocess.TimeoutExpired:
+                    log.warning(f"Serial monitor terminate timeout ({state.monitor_id}); killing process.")
+                    state.process.kill()
+            else:
+                asyncio.create_task(_detached_process_wait_popen(state.process, timeout_sec))
+        except ProcessLookupError:
+            pass
+        except Exception as e:
+            log.warning(f"Serial monitor terminate error ({state.monitor_id}): {e}")
+
+    for task in state.tasks:
+        task.cancel()
+    if wait_tasks:
+        for task in state.tasks:
+            try:
+                await asyncio.wait_for(task, timeout=timeout_sec)
+            except asyncio.TimeoutError:
+                log.warning(f"Serial monitor task timeout ({state.monitor_id}); skipping.")
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                pass
+    state.tasks = []
+    if state.reader_thread and state.reader_thread.is_alive():
+        if wait_tasks:
+            try:
+                await asyncio.to_thread(state.reader_thread.join, timeout_sec)
+            except Exception:
+                pass
+    state.reader_thread = None
+    state.running = False
+    state.process = None
+
+    if remove:
+        async with _SERIAL_MONITORS_LOCK:
+            _SERIAL_MONITORS.pop(state.monitor_id, None)
+
+async def _create_serial_monitor_state(
+    port: str,
+    baud: int,
+    buffer_lines: int,
+    log_path: Optional[Path],
+    board_fqbn: Optional[str],
+    protocol: Optional[str],
+    auto_reconnect: bool,
+    log_max_bytes: int,
+    log_rotate_count: int,
+) -> SerialMonitorState:
+    monitor_id = uuid.uuid4().hex[:8]
+    buffer: Deque[str] = deque(maxlen=buffer_lines)
+    state = SerialMonitorState(
+        monitor_id=monitor_id,
+        port=port,
+        baud=baud,
+        board_fqbn=board_fqbn,
+        protocol=protocol,
+        auto_reconnect=auto_reconnect,
+        auto_reconnect_user=auto_reconnect,
+        reconnect_delay=SERIAL_RECONNECT_INITIAL_DELAY,
+        stop_requested=False,
+        buffer_max=buffer_lines,
+        buffer=buffer,
+        log_path=log_path,
+        log_max_bytes=log_max_bytes,
+        log_rotate_count=log_rotate_count,
+    )
+    async with _SERIAL_MONITORS_LOCK:
+        _SERIAL_MONITORS[monitor_id] = state
+    try:
+        await _start_serial_monitor_state(state)
+        return state
+    except Exception:
+        async with _SERIAL_MONITORS_LOCK:
+            _SERIAL_MONITORS.pop(monitor_id, None)
+        raise
+
+async def _stop_monitors_for_port(port: str, force: bool = False, wait_tasks: bool = False) -> None:
+    to_stop: List[SerialMonitorState] = []
+    async with _SERIAL_MONITORS_LOCK:
+        for state in _SERIAL_MONITORS.values():
+            if state.port == port:
+                to_stop.append(state)
+    for state in to_stop:
+        await _stop_serial_monitor_state(state, remove=True, force=force, wait_tasks=wait_tasks)
+
+async def _pause_monitors_for_port(port: str, force: bool = False, wait_tasks: bool = False) -> List[SerialMonitorState]:
+    paused: List[SerialMonitorState] = []
+    async with _SERIAL_MONITORS_LOCK:
+        for state in _SERIAL_MONITORS.values():
+            if state.port == port and state.running:
+                paused.append(state)
+    for state in paused:
+        await _stop_serial_monitor_state(state, remove=False, force=force, wait_tasks=wait_tasks)
+    return paused
+
+async def _resume_monitors(states: List[SerialMonitorState]) -> List[str]:
+    restarted: List[str] = []
+    for state in states:
+        if not state.running:
+            try:
+                state.auto_reconnect = state.auto_reconnect_user
+                await _start_serial_monitor_state(state)
+                restarted.append(state.monitor_id)
+            except Exception as e:
+                log.warning(f"Failed to restart serial monitor ({state.monitor_id}): {e}")
+    return restarted
+# --- End Serial Monitor Helpers ---
 
 # --- Synchronous File I/O Helpers (Run in Executor Thread) ---
 # These helpers ensure blocking file I/O doesn't block the asyncio event loop.
@@ -1046,6 +1425,171 @@ async def list_boards() -> str:
 
 
 @mcp.tool()
+async def serial_monitor_start(
+    port: str,
+    baud: int = SERIAL_DEFAULT_BAUD,
+    buffer_lines: int = SERIAL_DEFAULT_BUFFER_LINES,
+    log_to_file: bool = True,
+    log_file: str = "",
+    board_fqbn: str = "",
+    protocol: str = "",
+    auto_reconnect: bool = True,
+    log_max_bytes: int = SERIAL_DEFAULT_LOG_MAX_BYTES,
+    log_rotate_count: int = SERIAL_DEFAULT_LOG_ROTATE_COUNT
+) -> str:
+    """
+    Starts a background serial monitor using arduino-cli and returns a monitor id.
+
+    Args:
+        port: Serial port address (e.g., COM3, /dev/ttyACM0).
+        baud: Baud rate for the serial connection (default 115200).
+        buffer_lines: Max lines to keep in memory (default 2000).
+        log_to_file: Whether to append incoming lines to a log file.
+        log_file: Optional explicit log file path (within user home). If empty, a default is used.
+        board_fqbn: Optional FQBN to help arduino-cli identify port settings.
+        protocol: Optional protocol (e.g., "serial").
+        auto_reconnect: If True, the monitor will restart when the port disconnects.
+        log_max_bytes: Max size of a log file before rotation (0 disables).
+        log_rotate_count: Number of rotated log files to keep (0 disables).
+
+    Returns:
+        A message with monitor id and log path.
+    """
+    log.info(f"Tool Call: serial_monitor_start(port='{port}', baud={baud})")
+    if not port:
+        raise ValueError("Serial port must be specified.")
+    if baud <= 0:
+        raise ValueError("Baud rate must be a positive integer.")
+    if buffer_lines <= 0:
+        raise ValueError("buffer_lines must be a positive integer.")
+    if log_max_bytes < 0:
+        raise ValueError("log_max_bytes must be >= 0.")
+    if log_rotate_count < 0:
+        raise ValueError("log_rotate_count must be >= 0.")
+
+    await _stop_monitors_for_port(port)
+
+    log_path: Optional[Path] = None
+    if log_to_file:
+        if log_file:
+            log_path = await _resolve_and_validate_path(
+                log_file,
+                allowed_bases=[USER_HOME],
+                check_existence=False
+            )
+        else:
+            log_path = _default_serial_log_path(port)
+
+    state = await _create_serial_monitor_state(
+        port=port,
+        baud=baud,
+        buffer_lines=buffer_lines,
+        log_path=log_path,
+        board_fqbn=board_fqbn or None,
+        protocol=protocol or None,
+        auto_reconnect=auto_reconnect,
+        log_max_bytes=log_max_bytes,
+        log_rotate_count=log_rotate_count,
+    )
+
+    log_hint = str(state.log_path) if state.log_path else "disabled"
+    return (
+        f"Serial monitor started: id={state.monitor_id}, port={state.port}, "
+        f"baud={state.baud}, log={log_hint}, max_bytes={state.log_max_bytes}, "
+        f"rotate={state.log_rotate_count}"
+    )
+
+
+@mcp.tool()
+async def serial_monitor_read(monitor_id: str, lines: int = 200) -> str:
+    """
+    Reads the latest lines from a running serial monitor buffer.
+    """
+    if not monitor_id:
+        raise ValueError("monitor_id is required.")
+    if lines <= 0:
+        raise ValueError("lines must be a positive integer.")
+
+    if _SERIAL_MONITORS_LOCK.locked():
+        return "Serial monitor registry busy; try again."
+    async with _SERIAL_MONITORS_LOCK:
+        state = _SERIAL_MONITORS.get(monitor_id)
+    if not state:
+        raise FileNotFoundError(f"Serial monitor not found: {monitor_id}")
+
+    buffer_snapshot = list(state.buffer)[-lines:]
+    header = f"Serial monitor {state.monitor_id} (port={state.port}, baud={state.baud}, running={state.running})"
+    if not buffer_snapshot:
+        return f"{header}\n(no data yet)"
+    return header + "\n" + "\n".join(buffer_snapshot)
+
+
+@mcp.tool()
+async def serial_monitor_list() -> str:
+    """
+    Lists active and paused serial monitors.
+    """
+    log.info("Tool Call: serial_monitor_list()")
+    if _SERIAL_MONITORS_LOCK.locked():
+        return "Serial monitor registry busy; try again."
+    async with _SERIAL_MONITORS_LOCK:
+        states = list(_SERIAL_MONITORS.values())
+
+    if not states:
+        return "No serial monitors."
+
+    lines_out = ["Serial monitors:"]
+    for state in states:
+        log_path = str(state.log_path) if state.log_path else "disabled"
+        lines_out.append(
+            f"- id={state.monitor_id} port={state.port} baud={state.baud} running={state.running} "
+            f"auto_reconnect={state.auto_reconnect} log={log_path} "
+            f"max_bytes={state.log_max_bytes} rotate={state.log_rotate_count} "
+            f"buffer={len(state.buffer)}/{state.buffer_max}"
+        )
+    return "\n".join(lines_out)
+
+
+@mcp.tool()
+async def serial_monitor_stop(
+    monitor_id: str,
+    force: bool = True,
+    wait_tasks: bool = False
+) -> str:
+    """
+    Stops a running serial monitor and releases the port.
+    Defaults to a fast stop (force kill + no waiting) to avoid tool timeouts.
+    When wait_tasks is False, the stop is scheduled in the background.
+    You do NOT need to call this before upload; upload auto-pauses/resumes monitors.
+    """
+    log.info(f"Tool Call: serial_monitor_stop(monitor_id='{monitor_id}', force={force}, wait_tasks={wait_tasks})")
+    if not monitor_id:
+        raise ValueError("monitor_id is required.")
+
+    async with _SERIAL_MONITORS_LOCK:
+        state = _SERIAL_MONITORS.get(monitor_id)
+    if not state:
+        raise FileNotFoundError(f"Serial monitor not found: {monitor_id}")
+
+    # Remove from registry immediately to avoid blocking calls
+    async with _SERIAL_MONITORS_LOCK:
+        _SERIAL_MONITORS.pop(monitor_id, None)
+
+    stop_coro = _stop_serial_monitor_state(
+        state,
+        remove=False,
+        force=force,
+        timeout_sec=2.0,
+        wait_tasks=wait_tasks
+    )
+    if wait_tasks:
+        await stop_coro
+        return f"Serial monitor stopped: {monitor_id}"
+    asyncio.create_task(stop_coro)
+    return f"Serial monitor stopping (async): {monitor_id}"
+
+
+@mcp.tool()
 async def verify_code(sketch_name: str, board_fqbn: str) -> str:
     """
     Verifies (compiles) the specified Arduino sketch for the given board FQBN
@@ -1106,10 +1650,18 @@ async def verify_code(sketch_name: str, board_fqbn: str) -> str:
 
 
 @mcp.tool()
-async def upload_sketch(sketch_name: str, port: str, board_fqbn: str) -> str:
+async def upload_sketch(
+    sketch_name: str,
+    port: str,
+    board_fqbn: str,
+    monitor_after_upload: bool = False,
+    monitor_baud: int = SERIAL_DEFAULT_BAUD
+) -> str:
     """
     Verifies (compiles) AND uploads the specified sketch to the Arduino board
     connected to the given serial port, using the specified FQBN.
+    If a serial monitor is running on the same port, it will be paused and
+    automatically resumed after the upload.
 
     Args:
         sketch_name: Name of the sketch directory within '~/Documents/Arduino_MCP_Sketches/'.
@@ -1119,6 +1671,9 @@ async def upload_sketch(sketch_name: str, port: str, board_fqbn: str) -> str:
         board_fqbn: The Fully Qualified Board Name identifying the target board hardware
                     (e.g., 'arduino:avr:uno', 'arduino:renesas_uno:unor4wifi').
                     Format must be 'vendor:arch:board'. Use 'list_boards' or 'board_search'. MANDATORY.
+        monitor_after_upload: If True, start a serial monitor after a successful upload
+                              (only if one wasn't already running on the port).
+        monitor_baud: Baud rate for the auto-started monitor (default 115200).
 
     Returns:
         Success message confirming the upload, potentially including compilation stats.
@@ -1132,7 +1687,7 @@ async def upload_sketch(sketch_name: str, port: str, board_fqbn: str) -> str:
         TimeoutError: If communication with the board times out during upload.
         Exception: For compilation errors or other upload issues reported by arduino-cli.
     """
-    log.info(f"Tool Call: upload_sketch(sketch='{sketch_name}', port='{port}', fqbn='{board_fqbn}')")
+    log.info(f"Tool Call: upload_sketch(sketch='{sketch_name}', port='{port}', fqbn='{board_fqbn}', monitor_after_upload={monitor_after_upload})")
     # Input validation
     if not sketch_name or any(c in sketch_name for c in ['/', '\\']) or ".." in sketch_name:
         raise ValueError("Invalid sketch_name. Cannot be empty or contain path separators or '..'.")
@@ -1140,6 +1695,8 @@ async def upload_sketch(sketch_name: str, port: str, board_fqbn: str) -> str:
         raise ValueError("Serial port must be specified.")
     if not board_fqbn or ":" not in board_fqbn or len(board_fqbn.split(':')) < 3:
         raise ValueError("Invalid or missing board_fqbn. Format must be 'vendor:arch:board'.")
+    if monitor_baud <= 0:
+        raise ValueError("monitor_baud must be a positive integer.")
 
     sketch_dir = SKETCHES_BASE_DIR / sketch_name
     sketch_path_abs = sketch_dir.resolve(strict=False)
@@ -1155,6 +1712,8 @@ async def upload_sketch(sketch_name: str, port: str, board_fqbn: str) -> str:
     if not ino_exists or not is_file:
         raise FileNotFoundError(f"Main sketch file '{main_ino_file.name}' not found or is not a file in {sketch_path_abs}")
 
+    paused_monitors: List[SerialMonitorState] = []
+    restarted_ids: List[str] = []
     try:
         # Ensure build directory exists (handled within _execute_compile now)
         # log.info(f"Using build path: {build_path_abs}")
@@ -1166,6 +1725,7 @@ async def upload_sketch(sketch_name: str, port: str, board_fqbn: str) -> str:
 
         # --- Step 2: Upload ---
         log.info("Starting upload step...")
+        paused_monitors = await _pause_monitors_for_port(port, force=True, wait_tasks=False)
         cmd_args_upload = [
             "upload",
             "--port", port,
@@ -1194,11 +1754,40 @@ async def upload_sketch(sketch_name: str, port: str, board_fqbn: str) -> str:
             # This case is less likely if check=True worked, but good for logging
             log.warning(f"{success_message} (Standard confirmation message not found in output; verify on device). Output:\n{upload_stdout}\n{upload_stderr}")
 
+        # Restart any monitors that were paused for upload
+        if paused_monitors:
+            restarted_ids = await _resume_monitors(paused_monitors)
+        elif monitor_after_upload:
+            try:
+                new_state = await _create_serial_monitor_state(
+                    port=port,
+                    baud=monitor_baud,
+                    buffer_lines=SERIAL_DEFAULT_BUFFER_LINES,
+                    log_path=_default_serial_log_path(port),
+                    board_fqbn=board_fqbn,
+                    protocol="serial",
+                    auto_reconnect=True,
+                    log_max_bytes=SERIAL_DEFAULT_LOG_MAX_BYTES,
+                    log_rotate_count=SERIAL_DEFAULT_LOG_ROTATE_COUNT
+                )
+                restarted_ids = [new_state.monitor_id]
+            except Exception as e:
+                log.warning(f"Failed to start serial monitor after upload: {e}")
+
+        if restarted_ids:
+            success_message += f" Serial monitor running: {', '.join(restarted_ids)}."
+
         return success_message
 
     except (FileNotFoundError, PermissionError, ValueError, ConnectionError, TimeoutError, Exception) as e:
         # Catch specific errors raised by _execute_compile or _run_arduino_cli_command
         log.error(f"Upload process failed for sketch '{sketch_name}': {e}")
+        # Attempt to restore any monitors we paused before failing
+        if paused_monitors:
+            try:
+                await _resume_monitors(paused_monitors)
+            except Exception as resume_err:
+                log.warning(f"Failed to resume serial monitor after upload error: {resume_err}")
         # Re-raise the specific error for better feedback
         raise Exception(f"Upload failed for sketch '{sketch_name}': {e}") from e
 

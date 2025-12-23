@@ -40,6 +40,8 @@ Environment variables override defaults:
 | LOG_LEVEL            | `INFO`                                              |
 | OPENAI_API_KEY       | your OpenAI API key (required for AI‑powered WireViz)|
 | OPENROUTER_API_KEY   | optional alternative to `OPENAI_API_KEY`            |
+| ARDUINO_SERIAL_LOG_MAX_BYTES | max size per serial log file (bytes; 0 disables) |
+| ARDUINO_SERIAL_LOG_ROTATE_COUNT | number of rotated serial logs to keep      |
 
 ## Quick Start
 
@@ -67,6 +69,12 @@ Server listens on STDIO for JSON-RPC MCP calls. Key methods:
 ### Boards
 - `list_boards()`
 - `board_search(query)`
+
+### Serial Monitor
+- `serial_monitor_start(port, baud, buffer_lines, log_to_file, ...)`
+- `serial_monitor_read(monitor_id, lines)`
+- `serial_monitor_list()`
+- `serial_monitor_stop(monitor_id)`
 
 ### File Ops
 - `rename_file(src, dest)`
@@ -104,4 +112,3 @@ To integrate with MCP clients (e.g., Claude Desktop), set your OpenAI API key in
 ## License
 
 MIT
-
