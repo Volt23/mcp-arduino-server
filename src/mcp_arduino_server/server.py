@@ -2166,6 +2166,177 @@ async def list_library_examples(library_name: str) -> str:
         raise Exception(f"An error occurred retrieving examples for '{library_name}': {type(e).__name__}") from e
 
 
+
+
+@mcp.tool()
+async def list_installed_libraries() -> str:
+    """
+    Lists all currently installed Arduino libraries with their versions
+    and install location (user vs built-in).
+
+    Useful to check what libs are available before compiling a sketch,
+    or to verify if a library was installed correctly after lib_install.
+
+    Returns:
+        A formatted table of installed libraries with name, version,
+        and location info. Returns a message if no libraries are found.
+
+    Raises:
+        Exception: If the arduino-cli command fails unexpectedly.
+    """
+    log.info("Tool Call: list_installed_libraries()")
+    try:
+        stdout, stderr, _ = await _run_arduino_cli_command(
+            ["lib", "list", "--format", "json"], check=True
+        )
+        raw = (stdout or stderr).strip()
+        if not raw:
+            return "No libraries installed yet. Use 'lib_install' to add some."
+
+        data = json.loads(raw)
+        libs_list = data if isinstance(data, list) else data.get("installed_libraries", [])
+
+        if not libs_list:
+            return "No libraries installed yet. Use 'lib_install' to add some."
+
+        lines = []
+        lines.append(f"{'Library':<40} {'Version':<12} {'Location'}")
+        lines.append("-" * 70)
+
+        for entry in libs_list:
+            lib_info = entry.get("library", entry)
+            name = lib_info.get("name", "unknown")
+            version = lib_info.get("version", "?")
+            location = lib_info.get("location", "user")
+            lines.append(f"{name:<40} {version:<12} {location}")
+
+        lines.append(f"\nTotal: {len(libs_list)} libraries installed.")
+        result = "\n".join(lines)
+        log.info(f"Listed {len(libs_list)} installed libraries.")
+        return result
+
+    except json.JSONDecodeError:
+        # fallback to plain text output if json parsing fails
+        log.warning("JSON parse failed for lib list, falling back to text output")
+        stdout, stderr, _ = await _run_arduino_cli_command(["lib", "list"], check=True)
+        return (stdout or stderr).strip() or "Could not retrieve installed libraries."
+    except Exception as e:
+        log.exception("Failed to list installed libraries")
+        raise Exception(f"Error listing installed libraries: {type(e).__name__}: {e}") from e
+
+
+@mcp.tool()
+async def list_cores() -> str:
+    """
+    Lists all installed Arduino platform cores (e.g. arduino:avr, esp32:esp32).
+    
+    Platform cores are needed to compile and upload sketches for specific
+    board families. Use this to check what platforms are avaliable or
+    to verify a core was installed correctly.
+
+    Returns:
+        Formatted list of installed cores with platform ID, version
+        and board name. Message if nothing installed.
+
+    Raises:
+        Exception: If the arduino-cli command fails.
+    """
+    log.info("Tool Call: list_cores()")
+    try:
+        stdout, stderr, _ = await _run_arduino_cli_command(
+            ["core", "list", "--format", "json"], check=True
+        )
+        raw = (stdout or stderr).strip()
+        if not raw:
+            return "No platform cores installed. Use 'core_install' to add one (e.g. 'arduino:avr')."
+
+        data = json.loads(raw)
+        platforms = data if isinstance(data, list) else data.get("platforms", [])
+
+        if not platforms:
+            return "No platform cores installed. Use 'core_install' to add one (e.g. 'arduino:avr')."
+
+        lines = []
+        lines.append(f"{'Platform ID':<30} {'Version':<12} {'Name'}")
+        lines.append("-" * 70)
+
+        for plat in platforms:
+            pid = plat.get("id", plat.get("ID", "unknown"))
+            ver = plat.get("installed_version", plat.get("installed", plat.get("version", "?")))
+            name = plat.get("name", "")
+            lines.append(f"{pid:<30} {ver:<12} {name}")
+
+        lines.append(f"\nTotal: {len(platforms)} platform(s) installed.")
+        result = "\n".join(lines)
+        log.info(f"Listed {len(platforms)} installed cores.")
+        return result
+
+    except json.JSONDecodeError:
+        log.warning("JSON parse failed for core list, using text output")
+        stdout, stderr, _ = await _run_arduino_cli_command(["core", "list"], check=True)
+        return (stdout or stderr).strip() or "Could not retrieve installed cores."
+    except Exception as e:
+        log.exception("Failed to list installed cores")
+        raise Exception(f"Error listing cores: {type(e).__name__}: {e}") from e
+
+
+@mcp.tool()
+async def core_install(platform_id: str) -> str:
+    """
+    Installs an Arduino platform core package.
+
+    Platform cores provide board definitions, toolchains and uploaders needed
+    to compile and upload code to specific board families.
+
+    Common platform IDs:
+      - arduino:avr (Uno, Mega, Nano, etc)
+      - arduino:megaavr (Nano Every)
+      - arduino:samd (MKR, Zero, Nano 33 IoT)
+      - esp32:esp32 (ESP32 boards - needs additional board URL)
+      - esp8266:esp8266 (ESP8266/NodeMCU - needs additional board URL)
+      - rp2040:rp2040 (Raspberry Pi Pico)
+
+    Args:
+        platform_id: The platform identifier to install (e.g. "arduino:avr", 
+                     "esp32:esp32"). Can include version like "arduino:avr@1.8.6".
+
+    Returns:
+        Success message with installed platform info.
+
+    Raises:
+        ValueError: If platform_id is empty.
+        FileNotFoundError: If the platform is not found in any configured index.
+        Exception: For network or other install errors.
+    """
+    log.info(f"Tool Call: core_install(platform_id='{platform_id}')")
+    if not platform_id:
+        raise ValueError("Platform ID cannot be empty.")
+
+    try:
+        stdout, stderr, _ = await _run_arduino_cli_command(
+            ["core", "install", platform_id], check=True
+        )
+        output = (stdout or stderr).strip()
+        log.info(f"Core install output: {output}")
+
+        output_lower = output.lower()
+        if "already installed" in output_lower:
+            return f"Platform '{platform_id}' is already installed at the latest version."
+        elif "installed" in output_lower or "downloaded" in output_lower:
+            return f"Successfully installed platform '{platform_id}'. You can now compile and upload sketches for boards in this platform."
+        else:
+            return f"Core install command finished for '{platform_id}'. Output: {output}"
+
+    except FileNotFoundError as e:
+        log.error(f"Platform not found: {platform_id}")
+        raise FileNotFoundError(
+            f"Platform '{platform_id}' not found. Make sure the platform ID is correct. "
+            f"For third-party platforms (ESP32, ESP8266), you may need to add the board manager URL first."
+        ) from e
+    except Exception as e:
+        log.exception(f"Core install failed for '{platform_id}'")
+        raise Exception(f"Failed to install platform '{platform_id}': {type(e).__name__}: {e}") from e
+
 @mcp.tool()
 async def read_file(filepath: str) -> str:
     """
